@@ -1,13 +1,12 @@
 #pragma once
 
-#include "duckdb/common/helper.hpp"
-#include "duckdb/common/case_insensitive_map.hpp"
-#include "duckdb/common/types.hpp"
-#include "duckdb/common/types/value.hpp"
+#include "avro_common.hpp"
 
-namespace duckdb {
+#include <map>
+#include <memory>
+#include <vector>
 
-namespace avro {
+namespace duckdb_avro {
 
 //! NOTE: This is copied (but modified) from 'parquet_extension.cpp', ideally this lives in core DuckDB instead
 
@@ -15,21 +14,17 @@ struct FieldID;
 
 struct ChildFieldIDs {
 public:
-	void Serialize(Serializer &serializer) const;
-	static ChildFieldIDs Deserialize(Deserializer &source);
+	std::map<string, FieldID> &Ids();
 
 public:
-	ChildFieldIDs Copy() const;
-	case_insensitive_map_t<FieldID> &Ids();
-
-public:
-	unique_ptr<case_insensitive_map_t<FieldID>> ids;
+	//! By lowercase name
+	std::shared_ptr<std::map<string, FieldID>> ids;
 };
 
 struct FieldID {
 public:
-	static constexpr const auto DUCKDB_FIELD_ID = "__duckdb_field_id";
-	static constexpr const auto DUCKDB_NULLABLE_ID = "__duckdb_nullable";
+	static constexpr const char *DUCKDB_FIELD_ID = "__duckdb_field_id";
+	static constexpr const char *DUCKDB_NULLABLE_ID = "__duckdb_nullable";
 
 public:
 	FieldID();
@@ -50,10 +45,8 @@ public:
 	FieldIDUtils() = delete;
 
 public:
-	static ChildFieldIDs ParseFieldIds(const Value &input, const vector<string> &names,
-	                                   const vector<LogicalType> &types);
+	static ChildFieldIDs ParseFieldIds(cxx::Context &context, const cxx::Value &input, const std::vector<string> &names,
+	                                   const std::vector<cxx::LogicalType> &types);
 };
 
-} // namespace avro
-
-} // namespace duckdb
+} // namespace duckdb_avro

@@ -44,19 +44,22 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 project(${TARGET_NAME})
 include_directories(src/include)
 
-set(EXTENSION_SOURCES
-    src/avro_extension.cpp src/avro_reader.cpp src/avro_copy.cpp
-    src/field_ids.cpp src/avro_multi_file_info.cpp src/avro_metadata.cpp)
+set(EXTENSION_SOURCES src/avro_extension.cpp src/avro_reader.cpp src/avro_type.cpp
+                      src/avro_copy.cpp src/field_ids.cpp)
 
-build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
-build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
+# The extension is written against DuckDB's stable C++ API. It uses parts of that API that are not stabilized yet, so
+# it is pinned to the DuckDB version it is built against
+build_static_extension_capi_unstable(${TARGET_NAME} ${EXTENSION_SOURCES})
+build_loadable_extension_capi_unstable(${TARGET_NAME} ${EXTENSION_SOURCES})
 
 target_include_directories(${EXTENSION_NAME} PRIVATE ${AVRO_INCLUDE_DIR})
 target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE ${AVRO_INCLUDE_DIR})
 
-# Link against avro-static - use plain signature to match DuckDB's build system
-target_link_libraries(${EXTENSION_NAME} avro-static)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} avro-static)
+# The statically linked extension binds the C API at link time, the loadable one through the table of functions it
+# is handed when it is loaded
+target_link_libraries(${EXTENSION_NAME} duckdb_cpp_api avro-static)
+target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE DUCKDB_CPP_API_LOADABLE)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} duckdb_cpp_api_loadable avro-static)
 
 # Mark avro-static as part of the export set
 install(

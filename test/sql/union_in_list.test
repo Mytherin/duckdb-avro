@@ -1,0 +1,37 @@
+# name: test/sql/union_in_list.test
+# description: read unions nested in large lists, whose elements are reallocated while they are read
+# group: [sql]
+
+require avro
+
+query I
+SELECT typeof(items) FROM read_avro('test/union_in_list.avro') LIMIT 1
+----
+UNION(u1 INTEGER, u2 VARCHAR, u3 STRUCT(a INTEGER, b VARCHAR))[]
+
+# every row holds 1000 items, item v (v = id * 1000 + position) is NULL, v, 's' || v or {a: v, b: 'p' || v} by v % 4
+query IIIII
+SELECT count(*), count(x), sum(x.u1), count(x.u2), sum(x.u3.a)
+FROM (SELECT unnest(items) x FROM read_avro('test/union_in_list.avro'))
+----
+20000	15000	49995000	5000	50005000
+
+query I
+SELECT count(*)
+FROM (
+	SELECT id * 1000 + i - 1 AS v, x
+	FROM (SELECT id, unnest(items) x, unnest(range(1, len(items) + 1)) i FROM read_avro('test/union_in_list.avro'))
+)
+WHERE (CASE v % 4
+	WHEN 0 THEN x IS NULL
+	WHEN 1 THEN union_tag(x) = 'u1' AND x.u1 = v
+	WHEN 2 THEN union_tag(x) = 'u2' AND x.u2 = 's' || v
+	ELSE union_tag(x) = 'u3' AND x.u3.a = v AND x.u3.b = 'p' || v END) IS NOT TRUE
+----
+0
+
+query II
+SELECT id, items[1000] FROM read_avro('test/union_in_list.avro') WHERE id IN (0, 7) ORDER BY id
+----
+0	{'a': 999, 'b': p999}
+7	{'a': 7999, 'b': p7999}

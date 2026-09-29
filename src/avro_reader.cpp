@@ -1,668 +1,886 @@
-#include "duckdb/common/vector/flat_vector.hpp"
-#include "duckdb/common/vector/list_vector.hpp"
-#include "duckdb/common/vector/map_vector.hpp"
-#include "duckdb/common/vector/struct_vector.hpp"
-#include "duckdb/common/vector/string_vector.hpp"
-#include "duckdb/common/vector/union_vector.hpp"
 #include "avro_reader.hpp"
-#include "utf8proc_wrapper.hpp"
-#include "duckdb/storage/external_file_cache/caching_file_system.hpp"
-#include "duckdb/common/file_system.hpp"
-#include "duckdb/common/multi_file/multi_file_data.hpp"
-#include "duckdb/common/types/uuid.hpp"
-#include "duckdb/common/types/interval.hpp"
-#include "duckdb/common/operator/multiply.hpp"
-#include "duckdb/common/vector/list_vector.hpp"
-#include "duckdb/common/vector/struct_vector.hpp"
-#include "duckdb/common/vector/map_vector.hpp"
-#include "duckdb/common/vector/union_vector.hpp"
 
-namespace duckdb {
+#include <algorithm>
+#include <atomic>
+#include <cstring>
 
-static LogicalType AvroLogicalTypeToLogicalType(avro_schema_t &avro_schema) {
-	auto logical_type_raw = avro_schema_logical_type(avro_schema);
-	if (!logical_type_raw) {
-		return LogicalType::INVALID;
-	}
-	// any nested types are handled switch case in TransformSchema
-	switch (avro_typeof(avro_schema)) {
-	case AVRO_ARRAY:
-	case AVRO_ENUM:
-	case AVRO_MAP:
-	case AVRO_RECORD:
-		return LogicalType::INVALID;
-	default:
-		break;
-	}
-	string logical_type = logical_type_raw;
-	if (logical_type == "date") {
-		return LogicalType::DATE;
-	}
-	if (logical_type == "decimal") {
-		auto scale = avro_schema_scale(avro_schema);
-		auto precision = avro_schema_precision(avro_schema);
-		return LogicalType::DECIMAL(precision, scale);
-	}
-	if (logical_type == "time-micros") {
-		return LogicalType::TIME;
-	}
-	if (logical_type == "timestamp-micros") {
-		auto adjust_to_utc = avro_schema_adjust_to_utc(avro_schema);
-		// -1 doesn't exist
-		if (adjust_to_utc > 0) {
-			return LogicalType::TIMESTAMP_TZ;
-		}
-		return LogicalType::TIMESTAMP;
-	}
-	if (logical_type == "timestamp-nanos") {
-		auto adjust_to_utc = avro_schema_adjust_to_utc(avro_schema);
-		if (adjust_to_utc > 0) {
-			throw NotImplementedException("Avro timestamp-nanos with adjust_to_utc not supported");
-		}
-		return LogicalType::TIMESTAMP_NS;
-	}
-	if (logical_type == "uuid") {
-		auto size = avro_schema_fixed_size(avro_schema);
-		if (size != 16) {
-			throw InvalidConfigurationException("logical type is uuid, but size != 16");
-		}
-		return LogicalType::UUID;
-	}
-	if (logical_type == "time-millis") {
-		return LogicalType::TIME;
-	}
-	if (logical_type == "timestamp-millis") {
-		auto adjust_to_utc = avro_schema_adjust_to_utc(avro_schema);
-		if (adjust_to_utc > 0) {
-			return LogicalType::TIMESTAMP_TZ;
-		}
-		return LogicalType::TIMESTAMP;
-	}
-	if (logical_type == "local-timestamp-millis") {
-		return LogicalType::TIMESTAMP;
-	}
-	throw NotImplementedException("Unknown Avro logical type %s", logical_type);
-}
+namespace duckdb_avro {
 
-static AvroType TransformSchema(avro_schema_t &avro_schema, unordered_set<string> parent_schema_names) {
-	auto duckdb_logical_type = AvroLogicalTypeToLogicalType(avro_schema);
-	bool has_logical_type = duckdb_logical_type != LogicalType::INVALID;
+static constexpr int64_t MICROS_PER_MSEC = 1000;
 
-	auto raw_lt = avro_schema_logical_type(avro_schema);
-	bool is_millis = raw_lt && (string(raw_lt) == "timestamp-millis" || string(raw_lt) == "time-millis" ||
-	                            string(raw_lt) == "local-timestamp-millis");
-
-	switch (avro_typeof(avro_schema)) {
-	case AVRO_NULL:
-		return AvroType(AVRO_NULL, LogicalType::SQLNULL);
-	case AVRO_BOOLEAN:
-		return AvroType(AVRO_BOOLEAN, LogicalType::BOOLEAN);
-	case AVRO_INT32: {
-		AvroType result(AVRO_INT32, has_logical_type ? duckdb_logical_type : LogicalType::INTEGER);
-		result.is_timestamp_millis = is_millis;
-		return result;
-	}
-	case AVRO_INT64: {
-		AvroType result(AVRO_INT64, has_logical_type ? duckdb_logical_type : LogicalType::BIGINT);
-		result.is_timestamp_millis = is_millis;
-		return result;
-	}
-	case AVRO_FLOAT:
-		return AvroType(AVRO_FLOAT, has_logical_type ? duckdb_logical_type : LogicalType::FLOAT);
-	case AVRO_DOUBLE:
-		return AvroType(AVRO_DOUBLE, has_logical_type ? duckdb_logical_type : LogicalType::DOUBLE);
-	case AVRO_BYTES:
-		return AvroType(AVRO_BYTES, has_logical_type ? duckdb_logical_type : LogicalType::BLOB);
-	case AVRO_STRING:
-		return AvroType(AVRO_STRING, has_logical_type ? duckdb_logical_type : LogicalType::VARCHAR);
-	case AVRO_UNION: {
-		auto num_children = avro_schema_union_size(avro_schema);
-		child_list_t<AvroType> union_children;
-		idx_t non_null_child_idx = 0;
-		unordered_map<idx_t, optional_idx> union_child_map;
-		for (idx_t child_idx = 0; child_idx < num_children; child_idx++) {
-			auto child_schema = avro_schema_union_branch(avro_schema, child_idx);
-			auto child_type = TransformSchema(child_schema, parent_schema_names);
-			union_children.emplace_back(
-			    std::pair<std::string, AvroType>(StringUtil::Format("u%llu", child_idx), std::move(child_type)));
-			if (child_type.duckdb_type.id() != LogicalTypeId::SQLNULL) {
-				union_child_map[child_idx] = non_null_child_idx++;
-			}
-		}
-		return AvroType(AVRO_UNION, LogicalTypeId::UNION, std::move(union_children), union_child_map);
-	}
-	case AVRO_RECORD: {
-		auto schema_name = string(avro_schema_name(avro_schema));
-		if (parent_schema_names.find(schema_name) != parent_schema_names.end()) {
-			throw InvalidInputException("Recursive Avro types not supported: %s", schema_name);
-		}
-		parent_schema_names.insert(schema_name);
-
-		auto num_children = avro_schema_record_size(avro_schema);
-		if (num_children == 0) {
-			// this we just ignore but we need a marker so we don't get our offsets
-			// wrong
-			return AvroType(AVRO_RECORD, LogicalTypeId::SQLNULL);
-		}
-		child_list_t<AvroType> struct_children;
-		for (idx_t child_idx = 0; child_idx < num_children; child_idx++) {
-			auto child_schema = avro_schema_record_field_get_by_index(avro_schema, child_idx);
-			auto child_type = TransformSchema(child_schema, parent_schema_names);
-			child_type.field_id = avro_schema_record_field_id(avro_schema, child_idx);
-			auto child_name = avro_schema_record_field_name(avro_schema, child_idx);
-			if (!child_name || strlen(child_name) == 0) {
-				throw InvalidInputException("Empty avro field name");
-			}
-
-			struct_children.emplace_back(std::pair<std::string, AvroType>(child_name, std::move(child_type)));
-		}
-
-		return AvroType(AVRO_RECORD, LogicalTypeId::STRUCT, std::move(struct_children));
-	}
-	case AVRO_ENUM: {
-		auto size = avro_schema_enum_number_of_symbols(avro_schema);
-		Vector levels(LogicalType::VARCHAR, size);
-		auto levels_data = FlatVector::GetDataMutable<string_t>(levels);
-		for (idx_t enum_idx = 0; enum_idx < static_cast<idx_t>(size); enum_idx++) {
-			levels_data[enum_idx] = StringVector::AddString(levels, avro_schema_enum_get(avro_schema, enum_idx));
-		}
-		levels.Verify();
-		return AvroType(AVRO_ENUM, LogicalType::ENUM(levels, size));
-	}
-	case AVRO_FIXED: {
-		return AvroType(AVRO_FIXED, has_logical_type ? duckdb_logical_type : LogicalType::BLOB);
-	}
-	case AVRO_ARRAY: {
-		auto child_schema = avro_schema_array_items(avro_schema);
-		auto element_id = avro_schema_array_element_id(avro_schema);
-		auto child_type = TransformSchema(child_schema, parent_schema_names);
-		child_type.field_id = element_id;
-		child_list_t<AvroType> list_children;
-		list_children.emplace_back(std::pair<std::string, AvroType>("list_entry", std::move(child_type)));
-		bool is_map = avro_schema_array_is_map(avro_schema);
-		if (is_map) {
-			return AvroType(AVRO_ARRAY, LogicalTypeId::MAP, std::move(list_children));
-		}
-		return AvroType(AVRO_ARRAY, LogicalTypeId::LIST, std::move(list_children));
-	}
-	case AVRO_MAP: {
-		auto child_schema = avro_schema_map_values(avro_schema);
-		auto key_id = avro_schema_map_key_id(avro_schema);
-		auto value_id = avro_schema_map_value_id(avro_schema);
-
-		AvroType key_type(AVRO_STRING, LogicalTypeId::VARCHAR);
-		key_type.field_id = key_id;
-		auto value_type = TransformSchema(child_schema, parent_schema_names);
-		value_type.field_id = value_id;
-
-		child_list_t<AvroType> map_children;
-		map_children.emplace_back(std::pair<std::string, AvroType>("key_entry", std::move(key_type)));
-		map_children.emplace_back(std::pair<std::string, AvroType>("value_entry", std::move(value_type)));
-		return AvroType(AVRO_MAP, LogicalTypeId::MAP, std::move(map_children));
-	}
-	case AVRO_LINK: {
-		auto target = avro_schema_link_target(avro_schema);
-		return TransformSchema(target, parent_schema_names);
-	}
-	default:
-		throw NotImplementedException("Unknown Avro Type %s", avro_schema_type_name(avro_schema));
+//===--------------------------------------------------------------------===//
+// Avro File
+//===--------------------------------------------------------------------===//
+AvroFileBuffer::AvroFileBuffer(cxx::Context &context, const string &path) {
+	auto fs = context.GetFileSystem();
+	auto handle = fs.OpenFile(path, {cxx::FileFlags::READ, cxx::FileFlags::EXTERNAL_FILE_CACHE});
+	data.resize(handle.Size());
+	if (!data.empty()) {
+		handle.ReadAt(data.data(), data.size(), 0);
 	}
 }
 
-AvroReader::AvroReader(ClientContext &context, OpenFileInfo file, const AvroFileReaderOptions &options)
-    : BaseFileReader(file) {
-	auto &fs = FileSystem::GetFileSystem(context);
-
-	FileOpenFlags flags = FileFlags::FILE_FLAGS_READ;
-	flags.SetCachingMode(CachingMode::ALWAYS_CACHE);
-	auto file_handle = fs.OpenFile(this->file, flags);
-	auto total_size = file_handle->GetFileSize();
-
-	local_buffer = Allocator::DefaultAllocator().Allocate(total_size);
-	fs.Read(*file_handle, local_buffer.get(), total_size);
-
-	if (avro_file_reader_memory(const_char_ptr_cast(local_buffer.get()), total_size, &reader)) {
-		throw InvalidInputException(avro_strerror());
+AvroFile::AvroFile(cxx::Context &context, const string &path_p) : path(path_p), buffer(context, path) {
+	if (avro_file_reader_memory(buffer.data.data(), static_cast<int64_t>(buffer.data.size()), &reader)) {
+		ThrowAvroError();
 	}
 	size_t file_block_count;
 	if (avro_file_reader_get_block_count(reader, &file_block_count)) {
-		throw InvalidInputException(avro_strerror());
+		ThrowAvroError();
 	}
 	block_count = file_block_count;
 
 	auto avro_schema = avro_file_reader_get_writer_schema(reader);
 	auto schema_name = avro_schema_name(avro_schema);
-	string root_name = schema_name ? schema_name : "avro_schema";
-
-	avro_type = TransformSchema(avro_schema, {});
-	auto root = AvroType::TransformAvroType(root_name, avro_type);
-	duckdb_type = root.type;
+	root_name = schema_name ? schema_name : "avro_schema";
+	try {
+		avro_type = TransformAvroSchema(avro_schema);
+	} catch (...) {
+		avro_schema_decref(avro_schema);
+		throw;
+	}
 	value_iface = avro_generic_class_from_schema(avro_schema);
-	if (!value_iface) {
-		throw InvalidInputException(avro_strerror());
-	}
-
-	// special handling for root structs, we pull up the entries
-	if (duckdb_type.id() == LogicalTypeId::STRUCT) {
-		columns = std::move(root.children);
-	} else {
-		columns.clear();
-		columns.push_back(std::move(root));
-	}
 	avro_schema_decref(avro_schema);
-}
-
-AvroReaderScanState::AvroReaderScanState(ClientContext &context, AvroReader &reader_p) : reader(reader_p) {
-	if (avro_file_block_reader_create(reader.reader, &block_reader)) {
-		throw InvalidInputException(avro_strerror());
-	}
-	if (avro_generic_value_new(reader.value_iface, &value)) {
-		avro_file_block_reader_close(block_reader);
-		block_reader = nullptr;
-		throw InvalidInputException(avro_strerror());
-	}
-	read_chunk.Initialize(context, {reader.duckdb_type}, STANDARD_VECTOR_SIZE);
-}
-
-AvroReaderScanState::~AvroReaderScanState() {
-	avro_value_decref(&value);
-	avro_file_block_reader_close(block_reader);
-}
-
-void AvroReaderScanState::SelectBlock(idx_t block_index) {
-	avro_value_reset(&value);
-	if (avro_file_block_reader_select_block(block_reader, block_index)) {
-		throw InvalidInputException(avro_strerror());
+	if (!value_iface) {
+		ThrowAvroError();
 	}
 }
 
-static void TransformValue(avro_value *avro_val, const AvroType &avro_type, Vector &target, idx_t out_idx) {
-
-	switch (avro_type.duckdb_type.id()) {
-	case LogicalTypeId::SQLNULL: {
-		FlatVector::SetNull(target, out_idx, true);
-		break;
+AvroFile::~AvroFile() {
+	if (value_iface) {
+		avro_value_iface_decref(value_iface);
 	}
-	case LogicalTypeId::BOOLEAN: {
-		int bool_val;
-		if (avro_value_get_boolean(avro_val, &bool_val)) {
-			throw InvalidInputException(avro_strerror());
+	if (reader) {
+		avro_file_reader_close(reader);
+	}
+}
+
+//===--------------------------------------------------------------------===//
+// Vector Writer
+//===--------------------------------------------------------------------===//
+//! Writes the decoded values of an Avro type into a vector. Pointers into the vector are cached, and forgotten
+//! whenever a list the vector is (nested) inside of grows, as that can move the vector's memory
+class AvroVectorWriter {
+public:
+	AvroVectorWriter(const AvroType &avro_type, std::shared_ptr<cxx::Vector> vector_p)
+	    : type(avro_type), vector(std::move(vector_p)) {
+		InitializeChildren();
+	}
+	AvroVectorWriter(const AvroType &avro_type, cxx::Vector vector_p)
+	    : AvroVectorWriter(avro_type, std::make_shared<cxx::Vector>(std::move(vector_p))) {
+	}
+
+public:
+	void Write(avro_value_t &value, idx_t row) {
+		switch (type.duckdb_type) {
+		case LogicalTypeId::SQLNULL:
+			SetNull(row);
+			break;
+		case LogicalTypeId::BOOLEAN: {
+			int bool_val;
+			if (avro_value_get_boolean(&value, &bool_val)) {
+				ThrowAvroError();
+			}
+			Data<bool>()[row] = bool_val != 0;
+			break;
 		}
-		FlatVector::GetDataMutable<uint8_t>(target)[out_idx] = bool_val != 0;
-		break;
-	}
-	case LogicalTypeId::DATE:
-	case LogicalTypeId::INTEGER: {
-		if (avro_value_get_int(avro_val, &FlatVector::GetDataMutable<int32_t>(target)[out_idx])) {
-			throw InvalidInputException(avro_strerror());
+		case LogicalTypeId::DATE:
+		case LogicalTypeId::INTEGER: {
+			if (avro_value_get_int(&value, &Data<int32_t>()[row])) {
+				ThrowAvroError();
+			}
+			break;
 		}
-		break;
+		case LogicalTypeId::TIME: {
+			int64_t result;
+			if (type.is_timestamp_millis) {
+				// time-millis: stored as int32 (ms since midnight), scale to µs
+				int32_t raw_val;
+				if (avro_value_get_int(&value, &raw_val)) {
+					ThrowAvroError();
+				}
+				result = static_cast<int64_t>(raw_val) * MICROS_PER_MSEC;
+			} else if (avro_value_get_long(&value, &result)) {
+				ThrowAvroError();
+			}
+			Data<int64_t>()[row] = result;
+			break;
+		}
+		case LogicalTypeId::TIMESTAMP:
+		case LogicalTypeId::TIMESTAMP_TZ:
+		case LogicalTypeId::TIMESTAMP_NS:
+		case LogicalTypeId::BIGINT: {
+			int64_t raw_val;
+			if (avro_value_get_long(&value, &raw_val)) {
+				ThrowAvroError();
+			}
+			Data<int64_t>()[row] = type.is_timestamp_millis ? MillisToMicros(raw_val) : raw_val;
+			break;
+		}
+		case LogicalTypeId::FLOAT:
+			if (avro_value_get_float(&value, &Data<float>()[row])) {
+				ThrowAvroError();
+			}
+			break;
+		case LogicalTypeId::DOUBLE:
+			if (avro_value_get_double(&value, &Data<double>()[row])) {
+				ThrowAvroError();
+			}
+			break;
+		case LogicalTypeId::UUID: {
+			size_t fixed_size = 16;
+			const void *fixed_data;
+			if (avro_value_get_fixed(&value, &fixed_data, &fixed_size)) {
+				ThrowAvroError();
+			}
+			cxx::uuid_t::Decoded bytes;
+			memcpy(bytes.bytes, fixed_data, sizeof(bytes.bytes));
+			Data<cxx::uuid_t>()[row] = cxx::uuid_t::Encode(bytes);
+			break;
+		}
+		case LogicalTypeId::DECIMAL:
+			WriteDecimal(value, row);
+			break;
+		case LogicalTypeId::BLOB:
+			WriteBlob(value, row);
+			break;
+		case LogicalTypeId::VARCHAR:
+			WriteString(value, row);
+			break;
+		case LogicalTypeId::STRUCT:
+			WriteStruct(value, row);
+			break;
+		case LogicalTypeId::UNION:
+			WriteUnion(value, row);
+			break;
+		case LogicalTypeId::ENUM:
+			WriteEnum(value, row);
+			break;
+		case LogicalTypeId::LIST:
+		case LogicalTypeId::MAP:
+			WriteList(value, row);
+			break;
+		default:
+			ThrowNotImplemented(FormatString("Reading Avro values as type %d", static_cast<int>(type.duckdb_type)));
+		}
 	}
-	case LogicalTypeId::TIME: {
+
+	void SetNull(idx_t row) {
+		if (type.duckdb_type == LogicalTypeId::UNION && !tags) {
+			// the union is read as its single non-null member (if it has one)
+			for (auto &child : children) {
+				if (child) {
+					child->SetNull(row);
+					return;
+				}
+			}
+		}
+		if (IsNested()) {
+			vector->SetNull(row);
+			return;
+		}
+		if (!validity) {
+			validity = vector->GetValidityMutable().words;
+		}
+		cxx::ValidityMask {validity}.SetInvalid(row);
+	}
+
+	//! Sets the final size of every list written into
+	void Finalize() {
+		if (IsList()) {
+			vector->SetListSize(list_size);
+		}
+		for (auto &child : children) {
+			if (child) {
+				child->Finalize();
+			}
+		}
+	}
+
+	//! Forgets the pointers into the vector and its children
+	void Invalidate() {
+		data = nullptr;
+		validity = nullptr;
+		tag_data = nullptr;
+		heap.reset();
+		for (auto &child : children) {
+			if (child) {
+				child->Invalidate();
+			}
+		}
+	}
+
+private:
+	bool IsNested() const {
+		switch (type.duckdb_type) {
+		case LogicalTypeId::STRUCT:
+		case LogicalTypeId::LIST:
+		case LogicalTypeId::MAP:
+		case LogicalTypeId::UNION:
+		case LogicalTypeId::SQLNULL:
+			return true;
+		default:
+			return false;
+		}
+	}
+	bool IsList() const {
+		return type.duckdb_type == LogicalTypeId::LIST || type.duckdb_type == LogicalTypeId::MAP;
+	}
+	//! Whether the union is read as a DuckDB UNION - rather than as its single non-null member
+	bool IsRealUnion() const {
+		idx_t member_count = 0;
+		for (auto member : type.union_child_map) {
+			if (member >= 0) {
+				member_count++;
+			}
+		}
+		return member_count > 1;
+	}
+
+	void AddChild(const AvroType &child_type, idx_t child_index) {
+		children.push_back(std::make_unique<AvroVectorWriter>(child_type, vector->GetChild(child_index)));
+	}
+
+	void InitializeChildren() {
+		switch (type.duckdb_type) {
+		case LogicalTypeId::STRUCT:
+			for (idx_t i = 0; i < type.children.size(); i++) {
+				AddChild(type.children[i].second, i);
+			}
+			break;
+		case LogicalTypeId::UNION: {
+			bool real_union = IsRealUnion();
+			for (idx_t i = 0; i < type.children.size(); i++) {
+				auto member = type.union_child_map[i];
+				if (member < 0) {
+					children.push_back(nullptr);
+				} else if (real_union) {
+					// child 0 holds the tags, the members follow
+					AddChild(type.children[i].second, static_cast<idx_t>(member) + 1);
+				} else {
+					// the union is read as this member - it writes into the same vector
+					children.push_back(std::make_unique<AvroVectorWriter>(type.children[i].second, vector));
+				}
+			}
+			if (real_union) {
+				tags = std::make_unique<cxx::Vector>(vector->GetChild(0));
+			}
+			break;
+		}
+		case LogicalTypeId::LIST:
+			AddChild(type.children[0].second, 0);
+			break;
+		case LogicalTypeId::MAP:
+			if (type.avro_type == AVRO_ARRAY) {
+				// an array of key-value records marked as a map - the keys and values are the fields of the records
+				auto &entry_type = type.children[0].second;
+				if (entry_type.duckdb_type != LogicalTypeId::STRUCT || entry_type.children.size() != 2) {
+					ThrowNotImplemented("An Avro array marked as map must hold records of a key and a value");
+				}
+				AddChild(entry_type.children[0].second, 0);
+				AddChild(entry_type.children[1].second, 1);
+			} else {
+				AddChild(type.children[0].second, 0);
+				AddChild(type.children[1].second, 1);
+			}
+			break;
+		default:
+			break;
+		}
+	}
+
+	template <class T>
+	T *Data() {
+		if (!data) {
+			data = vector->GetDataMutable();
+		}
+		return static_cast<T *>(data);
+	}
+
+	cxx::Arena &Heap() {
+		if (!heap) {
+			heap = std::make_unique<cxx::Arena>(vector->GetHeap());
+		}
+		return *heap;
+	}
+
+	static int64_t MillisToMicros(int64_t millis) {
 		int64_t result;
-		if (avro_type.is_timestamp_millis) {
-			// time-millis: stored as int32 (ms since midnight), scale to µs
-			int32_t raw_val;
-			if (avro_value_get_int(avro_val, &raw_val)) {
-				throw InvalidInputException(avro_strerror());
-			}
-			// no thread of overflow since raw value is int32_t
-			result = static_cast<int64_t>(raw_val) * Interval::MICROS_PER_MSEC;
-		} else {
-			if (avro_value_get_long(avro_val, &result)) {
-				throw InvalidInputException(avro_strerror());
-			}
+		if (__builtin_mul_overflow(millis, MICROS_PER_MSEC, &result)) {
+			ThrowError(ErrorCode::OUT_OF_RANGE,
+			           FormatString("Overflow in multiplication of INT64 (%lld * %lld)!",
+			                        static_cast<long long>(millis), static_cast<long long>(MICROS_PER_MSEC)));
 		}
-		FlatVector::GetDataMutable<int64_t>(target)[out_idx] = result;
-		break;
+		return result;
 	}
-	case LogicalTypeId::TIMESTAMP:
-	case LogicalTypeId::TIMESTAMP_TZ:
-	case LogicalTypeId::TIMESTAMP_NS:
-	case LogicalTypeId::BIGINT: {
-		int64_t raw_val;
-		if (avro_value_get_long(avro_val, &raw_val)) {
-			throw InvalidInputException(avro_strerror());
-		}
-		FlatVector::GetDataMutable<int64_t>(target)[out_idx] =
-		    avro_type.is_timestamp_millis ? MultiplyOperatorOverflowCheck::Operation<int64_t, int64_t, int64_t>(
-		                                        raw_val, Interval::MICROS_PER_MSEC)
-		                                  : raw_val;
-		break;
-	}
-	case LogicalTypeId::FLOAT: {
-		if (avro_value_get_float(avro_val, &FlatVector::GetDataMutable<float>(target)[out_idx])) {
-			throw InvalidInputException(avro_strerror());
-		}
-		break;
-	}
-	case LogicalTypeId::DOUBLE: {
-		if (avro_value_get_double(avro_val, &FlatVector::GetDataMutable<double>(target)[out_idx])) {
-			throw InvalidInputException(avro_strerror());
-		}
-		break;
-	}
-	case LogicalTypeId::UUID: {
-		size_t fixed_size = 16;
-		const void *fixed_data;
-		if (avro_value_get_fixed(avro_val, &fixed_data, &fixed_size)) {
-			throw InvalidInputException(avro_strerror());
-		}
-		FlatVector::GetDataMutable<hugeint_t>(target)[out_idx] = BaseUUID::FromBlob(const_data_ptr_cast(fixed_data));
-		break;
-	}
-	case LogicalTypeId::DECIMAL: {
+
+	void WriteDecimal(avro_value_t &value, idx_t row) {
 		// decimals should never be more than 16
 		const uint8_t bytes_data[16] = {};
 		const void *ptr = bytes_data;
 		size_t bytes_size;
 		avro_wrapped_buffer bytes_buf = AVRO_WRAPPED_BUFFER_EMPTY;
 
-		if (avro_type.avro_type == AVRO_BYTES) {
-			if (avro_value_grab_bytes(avro_val, &bytes_buf)) {
-				throw InvalidInputException(avro_strerror());
+		if (type.avro_type == AVRO_BYTES) {
+			if (avro_value_grab_bytes(&value, &bytes_buf)) {
+				ThrowAvroError();
 			}
 			ptr = bytes_buf.buf;
 			bytes_size = bytes_buf.size;
 		} else { // AVRO_FIXED
-			if (avro_value_get_fixed(avro_val, &ptr, &bytes_size)) {
-				throw InvalidInputException(avro_strerror());
+			if (avro_value_get_fixed(&value, &ptr, &bytes_size)) {
+				ThrowAvroError();
 			}
 		}
 
-		auto raw = const_data_ptr_cast(ptr);
+		auto raw = static_cast<const uint8_t *>(ptr);
 		// Sign bit is in the MSB of the first byte
 		bool negative = bytes_size > 0 && (raw[0] & 0x80);
 
-		switch (avro_type.duckdb_type.InternalType()) {
-		case PhysicalType::INT16: {
+		auto width = type.decimal_width;
+		if (width <= 4) {
 			uint16_t result = negative ? 0xFFFF : 0;
 			for (idx_t i = 0; i < bytes_size; i++) {
-				result = (result << 8) | raw[i];
+				result = static_cast<uint16_t>((result << 8) | raw[i]);
 			}
-			FlatVector::GetDataMutable<int16_t>(target)[out_idx] = (int16_t)result;
-			break;
-		}
-		case PhysicalType::INT32: {
+			Data<int16_t>()[row] = static_cast<int16_t>(result);
+		} else if (width <= 9) {
 			uint32_t result = negative ? 0xFFFFFFFF : 0;
 			for (idx_t i = 0; i < bytes_size; i++) {
 				result = (result << 8) | raw[i];
 			}
-			FlatVector::GetDataMutable<int32_t>(target)[out_idx] = (int32_t)result;
-			break;
-		}
-		case PhysicalType::INT64: {
+			Data<int32_t>()[row] = static_cast<int32_t>(result);
+		} else if (width <= 18) {
 			uint64_t result = negative ? ~0ULL : 0;
 			for (idx_t i = 0; i < bytes_size; i++) {
 				result = (result << 8) | raw[i];
 			}
-			FlatVector::GetDataMutable<int64_t>(target)[out_idx] = (int64_t)result;
-			break;
-		}
-		case PhysicalType::INT128: {
-			int64_t upper_val = 0;
-			uint64_t lower_val = 0;
-
-			// Calculate how many bytes go into upper and lower parts
-			idx_t upper_bytes;
-			if (bytes_size == 8) {
-				int64_t lower_val_signed = 0;
-				for (idx_t i = 0; i < bytes_size; i++) {
-					int64_t raw_byte = raw[i];
-					lower_val_signed |= (raw_byte << ((7 - i) * 8));
-				}
-				upper_bytes = 0;
-				auto ret = hugeint_t(lower_val_signed);
-				FlatVector::GetDataMutable<hugeint_t>(target)[out_idx] = ret;
-				break;
-			} else {
-				upper_bytes = (bytes_size <= sizeof(uint64_t)) ? bytes_size : (bytes_size - sizeof(uint64_t));
-			}
-
-			// Read upper part (big-endian)
-			// TODO: upper part might be sign extended bti.
-			for (idx_t i = 0; i < upper_bytes; i++) {
-				upper_val = (upper_val << 8) | raw[i];
-			}
-
-			// Handle sign extension for negative numbers
-			if (bytes_size > 0 && (raw[0] & 0x80)) {
-				// Fill remaining bytes with 1s for negative numbers
-				if (upper_bytes < sizeof(int64_t)) {
-					// Create a mask with 1s in the upper bits that need to be filled
-					int64_t mask = ((int64_t)1 << ((sizeof(int64_t) - upper_bytes) * 8)) - 1;
-					mask = mask << (upper_bytes * 8);
-					upper_val |= mask;
-				}
-			}
-
-			// Read lower part if there are remaining bytes
-			if (bytes_size > sizeof(int64_t)) {
-				for (idx_t i = upper_bytes; i < bytes_size; i++) {
-					lower_val = (lower_val << 8) | raw[i];
-				}
-			}
-
-			auto ret = hugeint_t(upper_val, lower_val);
-			FlatVector::GetDataMutable<hugeint_t>(target)[out_idx] = ret;
-			break;
-		}
-		default:
-			throw NotImplementedException("Unsupported decimal physical type");
+			Data<int64_t>()[row] = static_cast<int64_t>(result);
+		} else {
+			Data<cxx::int128_t>()[row] = ReadHugeint(raw, bytes_size);
 		}
 
-		if (avro_type.avro_type == AVRO_BYTES) {
+		if (type.avro_type == AVRO_BYTES) {
 			bytes_buf.free(&bytes_buf);
 		}
-		break;
 	}
-	case LogicalTypeId::BLOB:
-		switch (avro_type.avro_type) {
+
+	static cxx::int128_t ReadHugeint(const uint8_t *raw, idx_t bytes_size) {
+		if (bytes_size == 8) {
+			int64_t lower_val_signed = 0;
+			for (idx_t i = 0; i < bytes_size; i++) {
+				int64_t raw_byte = raw[i];
+				lower_val_signed |= (raw_byte << ((7 - i) * 8));
+			}
+			return cxx::int128_t {static_cast<uint64_t>(lower_val_signed), lower_val_signed < 0 ? -1 : 0};
+		}
+		int64_t upper_val = 0;
+		uint64_t lower_val = 0;
+		// Calculate how many bytes go into upper and lower parts
+		idx_t upper_bytes = (bytes_size <= sizeof(uint64_t)) ? bytes_size : (bytes_size - sizeof(uint64_t));
+
+		// Read upper part (big-endian)
+		for (idx_t i = 0; i < upper_bytes; i++) {
+			upper_val = (upper_val << 8) | raw[i];
+		}
+		// Handle sign extension for negative numbers
+		if (bytes_size > 0 && (raw[0] & 0x80)) {
+			// Fill remaining bytes with 1s for negative numbers
+			if (upper_bytes < sizeof(int64_t)) {
+				int64_t mask = ((int64_t)1 << ((sizeof(int64_t) - upper_bytes) * 8)) - 1;
+				mask = mask << (upper_bytes * 8);
+				upper_val |= mask;
+			}
+		}
+		// Read lower part if there are remaining bytes
+		if (bytes_size > sizeof(int64_t)) {
+			for (idx_t i = upper_bytes; i < bytes_size; i++) {
+				lower_val = (lower_val << 8) | raw[i];
+			}
+		}
+		return cxx::int128_t {lower_val, upper_val};
+	}
+
+	void WriteBlob(avro_value_t &value, idx_t row) {
+		switch (type.avro_type) {
 		case AVRO_FIXED: {
 			size_t fixed_size;
 			const void *fixed_data;
-			if (avro_value_get_fixed(avro_val, &fixed_data, &fixed_size)) {
-				throw InvalidInputException(avro_strerror());
+			if (avro_value_get_fixed(&value, &fixed_data, &fixed_size)) {
+				ThrowAvroError();
 			}
-			FlatVector::GetDataMutable<string_t>(target)[out_idx] =
-			    StringVector::AddStringOrBlob(target, const_char_ptr_cast(fixed_data), fixed_size);
+			auto blob = Heap().AddBlob(std::string_view(static_cast<const char *>(fixed_data), fixed_size));
+			Data<cxx::blob_t>()[row] = blob;
 			break;
 		}
 		case AVRO_BYTES: {
 			avro_wrapped_buffer blob_buf = AVRO_WRAPPED_BUFFER_EMPTY;
-			if (avro_value_grab_bytes(avro_val, &blob_buf)) {
-				throw InvalidInputException(avro_strerror());
+			if (avro_value_grab_bytes(&value, &blob_buf)) {
+				ThrowAvroError();
 			}
-			FlatVector::GetDataMutable<string_t>(target)[out_idx] =
-			    StringVector::AddStringOrBlob(target, const_char_ptr_cast(blob_buf.buf), blob_buf.size);
+			auto blob = Heap().AddBlob(std::string_view(static_cast<const char *>(blob_buf.buf), blob_buf.size));
 			blob_buf.free(&blob_buf);
+			Data<cxx::blob_t>()[row] = blob;
 			break;
 		}
 		default:
-			throw NotImplementedException("Unknown Avro blob type %s");
+			ThrowNotImplemented("Unknown Avro blob type");
 		}
-		break;
+	}
 
-	case LogicalTypeId::VARCHAR: {
+	void WriteString(avro_value_t &value, idx_t row) {
 		avro_wrapped_buffer str_buf = AVRO_WRAPPED_BUFFER_EMPTY;
-		if (avro_value_grab_string(avro_val, &str_buf)) {
-			throw InvalidInputException(avro_strerror());
+		if (avro_value_grab_string(&value, &str_buf)) {
+			ThrowAvroError();
 		}
 		// avro strings are null-terminated
-		D_ASSERT(const_char_ptr_cast(str_buf.buf)[str_buf.size - 1] == '\0');
-		if (Utf8Proc::Analyze(const_char_ptr_cast(str_buf.buf), str_buf.size - 1) == UnicodeType::INVALID) {
-			throw InvalidInputException("Avro file contains invalid unicode string");
+		std::string_view str(static_cast<const char *>(str_buf.buf), str_buf.size - 1);
+		try {
+			cxx::ValidateUTF8(str);
+		} catch (cxx::Exception &) {
+			str_buf.free(&str_buf);
+			ThrowInvalidInput("Avro file contains invalid unicode string");
 		}
-		FlatVector::GetDataMutable<string_t>(target)[out_idx] =
-		    StringVector::AddString(target, const_char_ptr_cast(str_buf.buf), str_buf.size - 1);
+		auto result = Heap().AddStringUnsafe(str);
 		str_buf.free(&str_buf);
-		break;
+		Data<cxx::varchar_t>()[row] = result;
 	}
-	case LogicalTypeId::STRUCT: {
+
+	void WriteStruct(avro_value_t &value, idx_t row) {
 		size_t child_count;
-		if (avro_value_get_size(avro_val, &child_count)) {
-			throw InvalidInputException(avro_strerror());
+		if (avro_value_get_size(&value, &child_count)) {
+			ThrowAvroError();
 		}
-		D_ASSERT(child_count == StructType::GetChildCount(target.GetType()));
-		D_ASSERT(child_count == avro_type.children.size());
-
 		for (idx_t child_idx = 0; child_idx < child_count; child_idx++) {
-			avro_value child_value;
-			if (avro_value_get_by_index(avro_val, child_idx, &child_value, nullptr)) {
-				throw InvalidInputException(avro_strerror());
+			avro_value_t child_value;
+			if (avro_value_get_by_index(&value, child_idx, &child_value, nullptr)) {
+				ThrowAvroError();
 			}
-			TransformValue(&child_value, avro_type.children[child_idx].second,
-			               StructVector::GetEntries(target)[child_idx], out_idx);
+			children[child_idx]->Write(child_value, row);
 		}
-		break;
 	}
 
-	case LogicalTypeId::UNION: {
+	void WriteUnion(avro_value_t &value, idx_t row) {
 		int discriminant = 0;
-		avro_value union_value;
-		if (avro_value_get_discriminant(avro_val, &discriminant) ||
-		    avro_value_get_current_branch(avro_val, &union_value)) {
-			throw InvalidInputException(avro_strerror());
+		avro_value_t union_value;
+		if (avro_value_get_discriminant(&value, &discriminant) || avro_value_get_current_branch(&value, &union_value)) {
+			ThrowAvroError();
 		}
-		if (static_cast<size_t>(discriminant) >= avro_type.children.size()) {
-			throw InvalidInputException("Invalid union tag");
+		if (discriminant < 0 || static_cast<size_t>(discriminant) >= type.children.size()) {
+			ThrowInvalidInput("Invalid union tag");
 		}
-
-		if (avro_type.children[discriminant].second.duckdb_type == LogicalTypeId::SQLNULL) {
-			FlatVector::SetNull(target, out_idx, true);
-			break;
+		auto member = type.union_child_map[discriminant];
+		if (member < 0) {
+			// the "null" branch
+			SetNull(row);
+			return;
 		}
-
-		if (target.GetType().id() == LogicalTypeId::UNION) {
-			auto duckdb_child_index = avro_type.union_child_map.at(discriminant).GetIndex();
-			auto &tags = UnionVector::GetTags(target);
-			FlatVector::GetDataMutable<union_tag_t>(tags)[out_idx] = duckdb_child_index;
-			auto &union_vector = UnionVector::GetMember(target, duckdb_child_index);
-
-			// orrrrrrrrrrrrr
-			for (idx_t child_idx = 1; child_idx < StructVector::GetEntries(target).size(); child_idx++) {
-				if (child_idx != duckdb_child_index + 1) { // duckdb child index is bigger because of the tag
-					FlatVector::SetNull(StructVector::GetEntries(target)[child_idx], out_idx, true);
-				}
+		auto &member_writer = *children[static_cast<idx_t>(discriminant)];
+		if (!tags) {
+			// the union is read as its single non-null member
+			member_writer.Write(union_value, row);
+			return;
+		}
+		if (!tag_data) {
+			tag_data = static_cast<uint8_t *>(tags->GetDataMutable());
+		}
+		tag_data[row] = static_cast<uint8_t>(member);
+		for (idx_t i = 0; i < children.size(); i++) {
+			if (children[i] && static_cast<int>(i) != discriminant) {
+				children[i]->SetNull(row);
 			}
-
-			TransformValue(&union_value, avro_type.children[discriminant].second, union_vector, out_idx);
-		} else { // directly recurse, we have dissolved the union
-			TransformValue(&union_value, avro_type.children[discriminant].second, target, out_idx);
 		}
-
-		break;
+		member_writer.Write(union_value, row);
 	}
-	case LogicalTypeId::ENUM: {
-		auto enum_type = EnumType::GetPhysicalType(target.GetType());
+
+	void WriteEnum(avro_value_t &value, idx_t row) {
 		int enum_val;
-
-		if (avro_value_get_enum(avro_val, &enum_val)) {
-			throw InvalidInputException(avro_strerror());
+		if (avro_value_get_enum(&value, &enum_val)) {
+			ThrowAvroError();
 		}
-		if (enum_val < 0 || static_cast<idx_t>(enum_val) >= EnumType::GetSize(target.GetType())) {
-			throw InvalidInputException("Enum value out of range");
+		auto size = type.enum_values.size();
+		if (enum_val < 0 || static_cast<idx_t>(enum_val) >= size) {
+			ThrowInvalidInput("Enum value out of range");
 		}
-
-		switch (enum_type) {
-		case PhysicalType::UINT8:
-			FlatVector::GetDataMutable<uint8_t>(target)[out_idx] = enum_val;
-			break;
-		case PhysicalType::UINT16:
-			FlatVector::GetDataMutable<uint16_t>(target)[out_idx] = enum_val;
-			break;
-		case PhysicalType::UINT32:
-			FlatVector::GetDataMutable<uint32_t>(target)[out_idx] = enum_val;
-			break;
-		default:
-			throw InternalException("Unsupported Enum Internal Type");
+		// the dictionary index is stored in the smallest unsigned integer type that can hold every index
+		if (size <= std::numeric_limits<uint8_t>::max()) {
+			Data<uint8_t>()[row] = static_cast<uint8_t>(enum_val);
+		} else if (size <= std::numeric_limits<uint16_t>::max()) {
+			Data<uint16_t>()[row] = static_cast<uint16_t>(enum_val);
+		} else {
+			Data<uint32_t>()[row] = static_cast<uint32_t>(enum_val);
 		}
-		break;
 	}
 
-	case LogicalTypeId::MAP:
-	case LogicalTypeId::LIST: {
-		size_t list_len;
-		if (avro_value_get_size(avro_val, &list_len)) {
-			throw InvalidInputException(avro_strerror());
+	//! Makes room for at least the given number of elements in the lists
+	void ReserveList(idx_t required) {
+		if (required <= list_capacity) {
+			return;
 		}
+		auto new_capacity = list_capacity == 0 ? 64 : list_capacity;
+		while (new_capacity < required) {
+			new_capacity *= 2;
+		}
+		vector->SetListSize(new_capacity);
+		list_capacity = new_capacity;
+		// growing the elements can move them
+		for (auto &child : children) {
+			child->Invalidate();
+		}
+	}
 
-		auto child_offset = ListVector::GetListSize(target);
-		ListVector::Reserve(target, child_offset + list_len);
+	void WriteList(avro_value_t &value, idx_t row) {
+		size_t list_len;
+		if (avro_value_get_size(&value, &list_len)) {
+			ThrowAvroError();
+		}
+		auto offset = list_size;
+		ReserveList(offset + list_len);
+		auto entries = Data<cxx::list_entry_t>();
+		entries[row].offset = offset;
+		entries[row].length = list_len;
 
-		if (avro_type.avro_type == AVRO_ARRAY) {
-			auto &child_vector = ListVector::GetChildMutable(target);
-
+		if (type.avro_type == AVRO_ARRAY && type.duckdb_type == LogicalTypeId::LIST) {
+			auto &child_writer = *children[0];
 			for (idx_t child_idx = 0; child_idx < list_len; child_idx++) {
 				avro_value_t child_value;
-				if (avro_value_get_by_index(avro_val, child_idx, &child_value, nullptr)) {
-					throw InvalidInputException(avro_strerror());
+				if (avro_value_get_by_index(&value, child_idx, &child_value, nullptr)) {
+					ThrowAvroError();
 				}
-				TransformValue(&child_value, avro_type.children[0].second, child_vector, child_offset + child_idx);
+				child_writer.Write(child_value, offset + child_idx);
+			}
+		} else if (type.avro_type == AVRO_ARRAY) {
+			// an array of key-value records marked as a map
+			for (idx_t entry_idx = 0; entry_idx < list_len; entry_idx++) {
+				avro_value_t entry_value;
+				if (avro_value_get_by_index(&value, entry_idx, &entry_value, nullptr)) {
+					ThrowAvroError();
+				}
+				for (idx_t i = 0; i < 2; i++) {
+					avro_value_t field_value;
+					if (avro_value_get_by_index(&entry_value, i, &field_value, nullptr)) {
+						ThrowAvroError();
+					}
+					children[i]->Write(field_value, offset + entry_idx);
+				}
 			}
 		} else {
-			auto &key_vector = MapVector::GetKeys(target);
-			auto &value_vector = MapVector::GetValues(target);
-
-			auto &key_type = avro_type.children[0].second;
-			//! Unused, always VARCHAR
-			(void)key_type;
-			auto &value_type = avro_type.children[1].second;
-			D_ASSERT(key_vector.GetType().id() == LogicalTypeId::VARCHAR);
-			auto string_ptr = FlatVector::GetDataMutable<string_t>(key_vector);
+			auto &key_writer = *children[0];
+			auto &value_writer = *children[1];
 			for (idx_t entry_idx = 0; entry_idx < list_len; entry_idx++) {
-				avro_value child_value;
+				avro_value_t child_value;
 				const char *map_key;
-				if (avro_value_get_by_index(avro_val, entry_idx, &child_value, &map_key)) {
-					throw InvalidInputException(avro_strerror());
+				if (avro_value_get_by_index(&value, entry_idx, &child_value, &map_key)) {
+					ThrowAvroError();
 				}
-				D_ASSERT(map_key);
-				string_ptr[child_offset + entry_idx] = StringVector::AddString(key_vector, map_key);
-				TransformValue(&child_value, value_type, value_vector, child_offset + entry_idx);
+				key_writer.WriteKey(map_key, offset + entry_idx);
+				value_writer.Write(child_value, offset + entry_idx);
 			}
 		}
-		auto list_vector_data = FlatVector::GetDataMutable<list_entry_t>(target);
-		list_vector_data[out_idx].length = list_len;
-		list_vector_data[out_idx].offset = child_offset;
-		ListVector::SetListSize(target, child_offset + list_len);
-		break;
+		list_size = offset + list_len;
 	}
 
-	default:
-		throw NotImplementedException(avro_type.duckdb_type.ToString());
+	void WriteKey(const char *key, idx_t row) {
+		auto result = Heap().AddString(key);
+		Data<cxx::varchar_t>()[row] = result;
+	}
+
+private:
+	const AvroType &type;
+	std::shared_ptr<cxx::Vector> vector;
+	std::vector<std::unique_ptr<AvroVectorWriter>> children;
+	//! The tags of a UNION
+	std::unique_ptr<cxx::Vector> tags;
+
+	void *data = nullptr;
+	uint64_t *validity = nullptr;
+	uint8_t *tag_data = nullptr;
+	std::unique_ptr<cxx::Arena> heap;
+	//! For lists: the number of elements written, and the number there is room for
+	idx_t list_size = 0;
+	idx_t list_capacity = 0;
+};
+
+//===--------------------------------------------------------------------===//
+// read_single_avro_file
+//===--------------------------------------------------------------------===//
+struct AvroBindData {
+	std::shared_ptr<AvroFile> file;
+	//! Whether the columns are the fields of the root record, rather than the root itself
+	bool root_is_record = false;
+};
+
+struct AvroGlobalState {
+	std::atomic<idx_t> next_block {0};
+};
+
+struct AvroLocalState {
+	explicit AvroLocalState(AvroFile &file) {
+		if (avro_file_block_reader_create(file.reader, &block_reader)) {
+			ThrowAvroError();
+		}
+		if (avro_generic_value_new(file.value_iface, &value)) {
+			avro_file_block_reader_close(block_reader);
+			ThrowAvroError();
+		}
+	}
+	~AvroLocalState() {
+		avro_value_decref(&value);
+		avro_file_block_reader_close(block_reader);
+	}
+	AvroLocalState(const AvroLocalState &) = delete;
+	AvroLocalState &operator=(const AvroLocalState &) = delete;
+
+	avro_file_block_reader_t block_reader = nullptr;
+	avro_value_t value;
+	//! The block claimed for this thread, which is only read (and decompressed) once the scan starts on it
+	idx_t block_index = 0;
+	bool block_selected = false;
+};
+
+//! Attaches the field ids of a column and its nested fields to the result column
+static void SetFieldIds(cxx::TableFunction::BindInput &input, idx_t column_index, std::vector<idx_t> &path,
+                        const AvroColumnDefinition &column) {
+	auto context = input.GetContext();
+	if (column.field_id != AvroType::NO_FIELD_ID) {
+		input.SetColumnIdentifier(column_index, path, cxx::Value::Create(context, column.field_id));
+	}
+	for (idx_t i = 0; i < column.children.size(); i++) {
+		path.push_back(i);
+		SetFieldIds(input, column_index, path, column.children[i]);
+		path.pop_back();
 	}
 }
 
-void AvroReader::Read(AvroReaderScanState &scan_state, DataChunk &output) {
-	idx_t out_idx = 0;
-	scan_state.read_chunk.Reset();
+static void ReadAvroBind(cxx::TableFunction::BindInput &input) {
+	auto context = input.GetContext();
+	auto path = string(input.GetArgument(0).Get<cxx::varchar_t>().view());
+	auto file = std::make_shared<AvroFile>(context, path);
 
-	D_ASSERT(scan_state.read_chunk.ColumnCount() == 1);
-	auto &read_vec = scan_state.read_chunk.data[0];
-	int ret = 0;
-	while ((ret = avro_file_block_reader_read_value(scan_state.block_reader, &scan_state.value)) == 0) {
-		TransformValue(&scan_state.value, avro_type, read_vec, out_idx++);
-		if (out_idx == STANDARD_VECTOR_SIZE) {
-			break;
-		}
-	}
-	if (ret != 0 && ret != EOF) {
-		throw InvalidInputException(avro_strerror());
-	}
-
-	// pull up root struct into output chunk
-	if (duckdb_type.id() == LogicalTypeId::STRUCT) {
-		for (idx_t col_idx = 0; col_idx < column_indexes.size(); col_idx++) {
-			if (column_indexes[col_idx].GetPrimaryIndex() >= columns.size()) {
-				continue; // to be filled in later
-			}
-			output.data[col_idx].Reference(
-			    StructVector::GetEntries(read_vec)[column_indexes[col_idx].GetPrimaryIndex()]);
-		}
+	auto root = TransformAvroType(context, file->root_name, file->avro_type);
+	std::vector<AvroColumnDefinition> columns;
+	bool root_is_record = root.type.GetTypeId() == LogicalTypeId::STRUCT;
+	if (root_is_record) {
+		// the fields of the root record are the columns
+		columns = std::move(root.children);
 	} else {
-		output.data[column_indexes[0].GetPrimaryIndex()].Reference(read_vec);
+		columns.push_back(std::move(root));
 	}
-	output.SetChildCardinality(out_idx);
+	for (idx_t i = 0; i < columns.size(); i++) {
+		input.AddResultColumn(columns[i].name, columns[i].type);
+		std::vector<idx_t> child_path;
+		SetFieldIds(input, i, child_path, columns[i]);
+	}
+
+	size_t metadata_count = 0;
+	if (avro_file_reader_get_metadata_count(file->reader, &metadata_count)) {
+		ThrowInvalidInput("Failed to get metadata count");
+	}
+	for (idx_t i = 0; i < metadata_count; i++) {
+		const char *key = nullptr;
+		const char *value = nullptr;
+		size_t value_size = 0;
+		if (avro_file_reader_get_metadata_by_index(file->reader, i, &key, &value, &value_size)) {
+			ThrowInvalidInput(FormatString("Failed to get metadata at index %llu", static_cast<unsigned long long>(i)));
+		}
+		if (!key) {
+			continue;
+		}
+		auto value_str = value ? string(value, value_size) : string();
+		input.AddFileMetadata(key, cxx::Value::Create(context, cxx::varchar_t(value_str)));
+	}
+
+	input.SetBindData<AvroBindData>(AvroBindData {std::move(file), root_is_record});
 }
 
-} // namespace duckdb
+static void ReadAvroInitGlobal(cxx::TableFunction::InitGlobalInput &input) {
+	auto &bind_data = input.GetBindData<AvroBindData>();
+	input.SetGlobalState<AvroGlobalState>();
+	// every block of the file can be read by a thread of its own
+	input.SetMaxThreads(std::max<idx_t>(bind_data.file->block_count, 1));
+}
+
+static void ReadAvroInitLocal(cxx::TableFunction::InitLocalInput &input) {
+	auto &bind_data = input.GetBindData<AvroBindData>();
+	input.SetLocalState<AvroLocalState>(*bind_data.file);
+}
+
+//! Every block of the file is a batch of its own. Batches are claimed while the scan hands out its work to the
+//! threads, so the block is only reserved here - it is read by the thread that claimed it, in the exec callback
+static void ReadAvroClaimBatch(cxx::TableFunction::ClaimBatchInput &input) {
+	auto &bind_data = input.GetBindData<AvroBindData>();
+	auto &global_state = input.GetGlobalState<AvroGlobalState>();
+	auto &local_state = input.GetLocalState<AvroLocalState>();
+	auto block_index = global_state.next_block++;
+	if (block_index >= bind_data.file->block_count) {
+		return;
+	}
+	local_state.block_index = block_index;
+	local_state.block_selected = false;
+	input.SetClaimed(true);
+}
+
+static void ReadAvroExec(cxx::TableFunction::ExecInput &input) {
+	auto &bind_data = input.GetBindData<AvroBindData>();
+	auto &local_state = input.GetLocalState<AvroLocalState>();
+	auto &root_type = bind_data.file->avro_type;
+	auto chunk = input.GetOutputChunk();
+	if (!local_state.block_selected) {
+		avro_value_reset(&local_state.value);
+		if (avro_file_block_reader_select_block(local_state.block_reader, local_state.block_index)) {
+			ThrowAvroError();
+		}
+		local_state.block_selected = true;
+	}
+
+	static const idx_t max_rows = cxx::StandardVectorSize();
+
+	// set up a writer for every column the scan reads - the vectors are sized to hold as many rows as they can, and
+	// sized down to the rows read at the end
+	auto column_count = input.GetColumnCount();
+	std::vector<idx_t> column_indexes;
+	std::vector<std::unique_ptr<AvroVectorWriter>> writers;
+	for (idx_t i = 0; i < column_count; i++) {
+		auto column_index = input.GetColumnIndex(i);
+		auto &column_type = bind_data.root_is_record ? root_type.children[column_index].second : root_type;
+		column_indexes.push_back(column_index);
+		auto vector = chunk.GetVector(i);
+		vector.SetSize(max_rows);
+		writers.push_back(std::make_unique<AvroVectorWriter>(column_type, std::move(vector)));
+	}
+
+	idx_t row = 0;
+	int ret;
+	while (row < max_rows &&
+	       (ret = avro_file_block_reader_read_value(local_state.block_reader, &local_state.value)) == 0) {
+		for (idx_t i = 0; i < writers.size(); i++) {
+			if (!bind_data.root_is_record) {
+				writers[i]->Write(local_state.value, row);
+				continue;
+			}
+			avro_value_t column_value;
+			if (avro_value_get_by_index(&local_state.value, column_indexes[i], &column_value, nullptr)) {
+				ThrowAvroError();
+			}
+			writers[i]->Write(column_value, row);
+		}
+		row++;
+	}
+	if (row < max_rows && ret != EOF) {
+		ThrowAvroError();
+	}
+	for (auto &writer : writers) {
+		writer->Finalize();
+	}
+	if (column_count > 0) {
+		chunk.GetVector(0).SetSize(row);
+	}
+}
+
+void AvroReaderFunctions::RegisterSingleFileFunction(cxx::Extension &extension, cxx::Context &context) {
+	auto function = cxx::TableFunction::Create(extension);
+	function.SetName("read_single_avro_file");
+	function.WithSignature([&](cxx::FunctionSignature &signature) {
+		signature.AddParameter("path", context.CreateType(LogicalTypeId::VARCHAR));
+	});
+	function.SetBindCallback(ReadAvroBind);
+	function.SetInitGlobalCallback(ReadAvroInitGlobal);
+	function.SetInitLocalCallback(ReadAvroInitLocal);
+	function.SetClaimBatchCallback(ReadAvroClaimBatch);
+	function.SetExecCallback(ReadAvroExec);
+	function.SetProjectionPushdown(true);
+	function.Register();
+}
+
+void AvroReaderFunctions::RegisterMultiFileFunction(cxx::Extension &extension, cxx::Context &context) {
+	auto function = cxx::MultiFileFunction::Create(extension);
+	function.SetName("read_avro");
+	function.SetSingleFileFunction("read_single_avro_file");
+	function.SetReaderType("Avro");
+	function.Register();
+}
+
+//===--------------------------------------------------------------------===//
+// avro_metadata
+//===--------------------------------------------------------------------===//
+struct AvroMetadataBindData {
+	string path;
+};
+
+struct AvroMetadataGlobalState {
+	std::vector<std::pair<string, string>> entries;
+	idx_t offset = 0;
+};
+
+static void AvroMetadataBind(cxx::TableFunction::BindInput &input) {
+	auto context = input.GetContext();
+	input.AddResultColumn("key", context.CreateType(LogicalTypeId::VARCHAR));
+	input.AddResultColumn("value", context.CreateType(LogicalTypeId::VARCHAR));
+	input.SetBindData<AvroMetadataBindData>(
+	    AvroMetadataBindData {string(input.GetArgument(0).Get<cxx::varchar_t>().view())});
+}
+
+static void AvroMetadataInitGlobal(cxx::TableFunction::InitGlobalInput &input) {
+	auto &bind_data = input.GetBindData<AvroMetadataBindData>();
+	auto context = input.GetContext();
+	AvroFileBuffer buffer(context, bind_data.path);
+
+	auto reader = avro_reader_memory(buffer.data.data(), static_cast<int64_t>(buffer.data.size()));
+	avro_file_reader_t file_reader;
+	if (avro_reader_reader(reader, &file_reader)) {
+		ThrowInvalidInput(FormatString("Failed to read Avro file: %s", avro_strerror()));
+	}
+	struct ReaderGuard {
+		avro_file_reader_t reader;
+		~ReaderGuard() {
+			avro_file_reader_close(reader);
+		}
+	} guard {file_reader};
+
+	size_t metadata_count = 0;
+	if (avro_file_reader_get_metadata_count(file_reader, &metadata_count)) {
+		ThrowInvalidInput("Failed to get metadata count");
+	}
+	AvroMetadataGlobalState result;
+	for (idx_t i = 0; i < metadata_count; i++) {
+		const char *key = nullptr;
+		const char *value = nullptr;
+		size_t value_size = 0;
+		if (avro_file_reader_get_metadata_by_index(file_reader, i, &key, &value, &value_size)) {
+			ThrowInvalidInput(FormatString("Failed to get metadata at index %llu", static_cast<unsigned long long>(i)));
+		}
+		result.entries.emplace_back(key ? string(key) : string(), value ? string(value, value_size) : string());
+	}
+	input.SetGlobalState<AvroMetadataGlobalState>(std::move(result));
+}
+
+static void AvroMetadataExec(cxx::TableFunction::ExecInput &input) {
+	auto &state = input.GetGlobalState<AvroMetadataGlobalState>();
+	auto chunk = input.GetOutputChunk();
+	auto keys = chunk.GetVector(0);
+	auto values = chunk.GetVector(1);
+	static const idx_t max_rows = cxx::StandardVectorSize();
+	idx_t count = 0;
+	while (state.offset < state.entries.size() && count < max_rows) {
+		auto &entry = state.entries[state.offset];
+		keys.AssignString(count, entry.first);
+		values.AssignString(count, entry.second);
+		state.offset++;
+		count++;
+	}
+	keys.SetSize(count);
+}
+
+void AvroReaderFunctions::RegisterMetadataFunction(cxx::Extension &extension, cxx::Context &context) {
+	auto function = cxx::TableFunction::Create(extension);
+	function.SetName("avro_metadata");
+	function.WithSignature([&](cxx::FunctionSignature &signature) {
+		signature.AddParameter("path", context.CreateType(LogicalTypeId::VARCHAR));
+	});
+	function.SetBindCallback(AvroMetadataBind);
+	function.SetInitGlobalCallback(AvroMetadataInitGlobal);
+	function.SetExecCallback(AvroMetadataExec);
+	function.Register();
+}
+
+} // namespace duckdb_avro

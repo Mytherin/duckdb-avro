@@ -1,17 +1,26 @@
 #include "field_ids.hpp"
-#include "include/field_ids.hpp"
 
-#include "duckdb/common/exception/list.hpp"
+#include <algorithm>
+#include <cctype>
+#include <unordered_set>
 
-namespace duckdb {
-
-namespace avro {
+namespace duckdb_avro {
 
 constexpr const char *FieldID::DUCKDB_FIELD_ID;
+constexpr const char *FieldID::DUCKDB_NULLABLE_ID;
 
-case_insensitive_map_t<FieldID> &ChildFieldIDs::Ids() {
+static string Lower(string str) {
+	std::transform(str.begin(), str.end(), str.begin(), [](unsigned char c) { return std::tolower(c); });
+	return str;
+}
+
+[[noreturn]] static void ThrowBinderError(const string &message) {
+	ThrowError(ErrorCode::BINDER, message);
+}
+
+std::map<string, FieldID> &ChildFieldIDs::Ids() {
 	if (!ids) {
-		ids = make_uniq<case_insensitive_map_t<FieldID>>();
+		ids = std::make_shared<std::map<string, FieldID>>();
 	}
 	return *ids;
 }
@@ -23,48 +32,49 @@ FieldID::FieldID(int32_t field_id_p, bool nullable) : set(true), field_id(field_
 }
 
 int32_t FieldID::GetFieldId() const {
-	D_ASSERT(set);
 	return field_id;
 }
 
-static case_insensitive_map_t<LogicalType> GetChildNameToTypeMap(const LogicalType &type) {
-	case_insensitive_map_t<LogicalType> name_to_type_map;
-	switch (type.id()) {
+//! The nested fields a FIELD_IDS entry can be given for, by lowercase name
+using NameToTypeMap = std::map<string, cxx::LogicalType>;
+
+static NameToTypeMap GetChildNameToTypeMap(const cxx::LogicalType &type) {
+	NameToTypeMap name_to_type_map;
+	switch (type.GetTypeId()) {
 	case LogicalTypeId::LIST:
-		name_to_type_map.emplace("list", ListType::GetChildType(type));
+		name_to_type_map.emplace("list", type.GetListChildType());
 		break;
 	case LogicalTypeId::MAP:
-		name_to_type_map.emplace("key", MapType::KeyType(type));
-		name_to_type_map.emplace("value", MapType::ValueType(type));
+		name_to_type_map.emplace("key", type.GetMapKeyType());
+		name_to_type_map.emplace("value", type.GetMapValueType());
 		break;
 	case LogicalTypeId::STRUCT:
-		for (auto &child_type : StructType::GetChildTypes(type)) {
-			if (child_type.first == FieldID::DUCKDB_FIELD_ID) {
-				throw BinderException("Cannot have column named \"%s\" with FIELD_IDS", FieldID::DUCKDB_FIELD_ID);
+		for (idx_t i = 0; i < type.GetStructChildCount(); i++) {
+			auto child_name = type.GetStructChildName(i);
+			if (child_name == FieldID::DUCKDB_FIELD_ID) {
+				ThrowBinderError(
+				    FormatString("Cannot have column named \"%s\" with FIELD_IDS", FieldID::DUCKDB_FIELD_ID));
 			}
-			name_to_type_map.emplace(child_type);
+			name_to_type_map.emplace(Lower(child_name), type.GetStructChildType(i));
 		}
 		break;
-	default: // LCOV_EXCL_START
-		throw InternalException("Unexpected type in GetChildNameToTypeMap");
-	} // LCOV_EXCL_STOP
+	default:
+		ThrowError(ErrorCode::INTERNAL, "Unexpected type in GetChildNameToTypeMap");
+	}
 	return name_to_type_map;
 }
 
-static void GetFieldIDs(const Value &field_ids_value, ChildFieldIDs &field_ids_p,
-                        unordered_set<uint32_t> &unique_field_ids,
-                        const case_insensitive_map_t<LogicalType> &name_to_type_map) {
-	const auto &struct_type = field_ids_value.type();
-	if (struct_type.id() != LogicalTypeId::STRUCT) {
-		throw BinderException(
+static void GetFieldIDs(cxx::Context &context, const cxx::Value &field_ids_value, ChildFieldIDs &field_ids_p,
+                        std::unordered_set<uint32_t> &unique_field_ids, const NameToTypeMap &name_to_type_map) {
+	auto struct_type = field_ids_value.GetLogicalType();
+	if (struct_type.GetTypeId() != LogicalTypeId::STRUCT) {
+		ThrowBinderError(FormatString(
 		    "Expected FIELD_IDS to be a STRUCT, e.g., {col1: 42, col2: {%s: 43, nested_col: 44}, col3: 44}",
-		    FieldID::DUCKDB_FIELD_ID);
+		    FieldID::DUCKDB_FIELD_ID));
 	}
-	const auto &struct_children = StructValue::GetChildren(field_ids_value);
 	auto &field_ids = field_ids_p.Ids();
-	D_ASSERT(StructType::GetChildTypes(struct_type).size() == struct_children.size());
-	for (idx_t i = 0; i < struct_children.size(); i++) {
-		const auto &col_name = StringUtil::Lower(StructType::GetChildName(struct_type, i).GetIdentifierName());
+	for (idx_t i = 0; i < struct_type.GetStructChildCount(); i++) {
+		const auto col_name = Lower(struct_type.GetStructChildName(i));
 		if (col_name == FieldID::DUCKDB_FIELD_ID || col_name == FieldID::DUCKDB_NULLABLE_ID) {
 			continue;
 		}
@@ -78,84 +88,80 @@ static void GetFieldIDs(const Value &field_ids_value, ChildFieldIDs &field_ids_p
 				}
 				names += name.first;
 			}
-			throw BinderException(
+			ThrowBinderError(FormatString(
 			    "Column name \"%s\" specified in FIELD_IDS not found. Consider using WRITE_PARTITION_COLUMNS if this "
 			    "column is a partition column. Available column names: [%s]",
-			    col_name, names);
+			    col_name.c_str(), names.c_str()));
 		}
-		D_ASSERT(field_ids.find(col_name) == field_ids.end()); // Caught by STRUCT - deduplicates keys
 
-		const auto &child_value = struct_children[i];
-		const auto &child_type = child_value.type();
-		optional_ptr<const Value> field_id_value;
-		optional_ptr<const Value> field_id_nullable;
-		optional_ptr<const Value> child_field_ids_value;
+		auto child_value = field_ids_value.GetChild(i);
+		auto child_type = child_value.GetLogicalType();
+		std::unique_ptr<cxx::Value> field_id_value;
+		std::unique_ptr<cxx::Value> field_id_nullable;
+		bool has_nested_field_ids = false;
 
-		if (child_type.id() == LogicalTypeId::STRUCT) {
-			const auto &nested_children = StructValue::GetChildren(child_value);
-			D_ASSERT(StructType::GetChildTypes(child_type).size() == nested_children.size());
-			for (idx_t nested_i = 0; nested_i < nested_children.size(); nested_i++) {
-				const auto &field_id_or_nested_col = StructType::GetChildName(child_type, nested_i);
+		if (child_type.GetTypeId() == LogicalTypeId::STRUCT) {
+			for (idx_t nested_i = 0; nested_i < child_type.GetStructChildCount(); nested_i++) {
+				const auto field_id_or_nested_col = child_type.GetStructChildName(nested_i);
 				if (field_id_or_nested_col == FieldID::DUCKDB_FIELD_ID) {
-					field_id_value = &nested_children[nested_i];
+					field_id_value = std::make_unique<cxx::Value>(child_value.GetChild(nested_i));
 				} else if (field_id_or_nested_col == FieldID::DUCKDB_NULLABLE_ID) {
-					field_id_nullable = &nested_children[nested_i];
+					field_id_nullable = std::make_unique<cxx::Value>(child_value.GetChild(nested_i));
 				} else {
-					child_field_ids_value = &child_value;
+					has_nested_field_ids = true;
 				}
 			}
 		} else {
-			field_id_value = &child_value;
+			field_id_value = std::make_unique<cxx::Value>(std::move(child_value));
 		}
 
 		FieldID field_id;
 		if (field_id_value) {
-			Value field_id_integer_value = field_id_value->DefaultCastAs(LogicalType::INTEGER);
-			const uint32_t field_id_int = IntegerValue::Get(field_id_integer_value);
-			if (!unique_field_ids.insert(field_id_int).second) {
-				throw BinderException("Duplicate field_id %s found in FIELD_IDS", field_id_integer_value.ToString());
+			auto integer_type = context.CreateType(LogicalTypeId::INTEGER);
+			const auto field_id_int = field_id_value->Cast(context, integer_type).Get<int32_t>();
+			if (!unique_field_ids.insert(static_cast<uint32_t>(field_id_int)).second) {
+				ThrowBinderError(FormatString("Duplicate field_id %d found in FIELD_IDS", field_id_int));
 			}
 			if (field_id_nullable) {
-				Value field_id_bool_value = field_id_nullable->DefaultCastAs(LogicalType::BOOLEAN);
-				const bool field_id_bool = BooleanValue::Get(field_id_bool_value);
-				field_id = FieldID(UnsafeNumericCast<int32_t>(field_id_int), field_id_bool);
+				auto boolean_type = context.CreateType(LogicalTypeId::BOOLEAN);
+				field_id = FieldID(field_id_int, field_id_nullable->Cast(context, boolean_type).Get<bool>());
 			} else {
-				field_id = FieldID(UnsafeNumericCast<int32_t>(field_id_int));
+				field_id = FieldID(field_id_int);
 			}
 		}
 		auto inserted = field_ids.emplace(col_name, std::move(field_id));
-		D_ASSERT(inserted.second);
 
-		if (child_field_ids_value) {
+		if (has_nested_field_ids) {
 			const auto &col_type = it->second;
-			if (col_type.id() != LogicalTypeId::LIST && col_type.id() != LogicalTypeId::MAP &&
-			    col_type.id() != LogicalTypeId::STRUCT) {
-				throw BinderException("Column \"%s\" with type \"%s\" cannot have a nested FIELD_IDS specification",
-				                      col_name, LogicalTypeIdToString(col_type.id()));
+			auto col_type_id = col_type.GetTypeId();
+			if (col_type_id != LogicalTypeId::LIST && col_type_id != LogicalTypeId::MAP &&
+			    col_type_id != LogicalTypeId::STRUCT) {
+				ThrowBinderError(FormatString("Column \"%s\" with type \"%s\" cannot have a nested FIELD_IDS "
+				                              "specification",
+				                              col_name.c_str(), string(col_type.GetName()).c_str()));
 			}
-
-			GetFieldIDs(*child_field_ids_value, inserted.first->second.children, unique_field_ids,
+			GetFieldIDs(context, field_ids_value.GetChild(i), inserted.first->second.children, unique_field_ids,
 			            GetChildNameToTypeMap(col_type));
 		}
 	}
 }
 
-ChildFieldIDs FieldIDUtils::ParseFieldIds(const Value &input, const vector<string> &names,
-                                          const vector<LogicalType> &types) {
-	unordered_set<uint32_t> unique_field_ids;
-	case_insensitive_map_t<LogicalType> name_to_type_map;
+ChildFieldIDs FieldIDUtils::ParseFieldIds(cxx::Context &context, const cxx::Value &input,
+                                          const std::vector<string> &names,
+                                          const std::vector<cxx::LogicalType> &types) {
+	std::unordered_set<uint32_t> unique_field_ids;
+	NameToTypeMap name_to_type_map;
 	for (idx_t col_idx = 0; col_idx < names.size(); col_idx++) {
 		if (names[col_idx] == FieldID::DUCKDB_FIELD_ID) {
-			throw BinderException("Cannot have a column named \"%s\" when writing FIELD_IDS", FieldID::DUCKDB_FIELD_ID);
+			ThrowBinderError(
+			    FormatString("Cannot have a column named \"%s\" when writing FIELD_IDS", FieldID::DUCKDB_FIELD_ID));
 		}
-		name_to_type_map.emplace(names[col_idx], types[col_idx]);
+		name_to_type_map.emplace(Lower(names[col_idx]), types[col_idx].Copy());
 	}
 
 	ChildFieldIDs result;
-	GetFieldIDs(input, result, unique_field_ids, name_to_type_map);
+	GetFieldIDs(context, input, result, unique_field_ids, name_to_type_map);
 	return result;
 }
 
-} // namespace avro
-
-} // namespace duckdb
+} // namespace duckdb_avro

@@ -12,12 +12,16 @@ as follows:
   - the reusable workflow `duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml` for the `duckdb-stable-build` job should be set to latest tagged release
 
 # API changes
-DuckDB extensions built with this extension template are built against the internal C++ API of DuckDB. This API is not guaranteed to be stable.
-What this means for extension development is that when updating your extensions DuckDB target version using the above steps, you may run into the fact that your extension no longer builds properly.
+This extension is built against DuckDB's stable C++ API (`duckdb/tools/cpp/duckdb_cpp.hpp`), which wraps the V2 C API,
+rather than against DuckDB's internal C++ API. It does not include any other DuckDB header.
 
-Currently, DuckDB does not (yet) provide a specific change log for these API changes, but it is generally not too hard to figure out what has changed.
+It uses parts of that API that are not stabilized yet (multi-file functions, column identifiers and file metadata,
+batch claiming, written statistics of `COPY ... TO`, the external file cache flag). These are marked "Unstable API" in
+`duckdb_cpp.hpp`, and until they are stabilized the extension is built as a *pinned* extension
+(`build_static_extension_capi_unstable` / `build_loadable_extension_capi_unstable` in `CMakeLists.txt`): a build only
+loads into the exact DuckDB version it was built against. Once these functions are stabilized, the build can switch to
+the versioned helpers (`build_loadable_extension_capi_v2`), and a single build then loads into every later DuckDB
+version.
 
-For figuring out how and why the C++ API changed, we recommend using the following resources:
-- DuckDB's [Release Notes](https://github.com/duckdb/duckdb/releases)
-- DuckDB's history of [Core extension patches](https://github.com/duckdb/duckdb/commits/main/.github/patches/extensions)
-- The git history of the relevant C++ Header file of the API that has changed
+When updating the DuckDB version, check the "Unstable API" parts of `duckdb_cpp.hpp` for changes - everything else
+this extension uses is stable.
